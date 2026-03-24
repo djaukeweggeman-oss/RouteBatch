@@ -1,0 +1,5 @@
+[info] %cDownload the React DevTools for a better development experience: https://reactjs.org/link/react-devtools font-weight:bold
+[log] 🚗 Selected driver: Auke Weggeman
+[log] 📍 Found 3 addresses for this driver
+[log] 🗺️ Starting route optimization from ARNHEM (server)...
+[log] ✅ Route optimization complete: {stops: Array(3), totalDistance: 25300, totalDuration: 2040}
