@@ -146,19 +146,8 @@ export async function POST(req: NextRequest) {
             for (const [day, addrs] of Object.entries(dayMap)) {
                 console.log(`📅 Processing day: ${day} with ${addrs.length} addresses`);
                 
-                // Deduplicate per day on volledigAdres, but sum up plaatsingen
-                const addressMap = new Map<string, Address>();
-                for (const addr of addrs) {
-                    if (addressMap.has(addr.volledigAdres)) {
-                        const existing = addressMap.get(addr.volledigAdres)!;
-                        existing.aantalPlaatsingen = (existing.aantalPlaatsingen || 0) + (addr.aantalPlaatsingen || 0);
-                    } else {
-                        addressMap.set(addr.volledigAdres, { ...addr });
-                    }
-                }
-                
-                const unique = Array.from(addressMap.values());
-                console.log(`✅ After dedup for ${day}: ${addrs.length} → ${unique.length} unique addresses`);
+                const unique = addrs;
+                console.log(`✅ For ${day}: ${unique.length} addresses`);
 
                 // Call RouteOptimizer for this day's addresses
                 let optimized;
@@ -195,18 +184,7 @@ export async function POST(req: NextRequest) {
         // 🚗 SINGLE-DAY PATH: Original behavior - one big route
         console.log('🚗 Single-day route. Making one optimized route...');
 
-        // Deduplicate
-        const addressMap = new Map<string, Address>();
-        for (const addr of validAddresses) {
-            if (addressMap.has(addr.volledigAdres)) {
-                const existing = addressMap.get(addr.volledigAdres)!;
-                existing.aantalPlaatsingen = (existing.aantalPlaatsingen || 0) + (addr.aantalPlaatsingen || 0);
-            } else {
-                addressMap.set(addr.volledigAdres, { ...addr });
-            }
-        }
-        
-        const unique = Array.from(addressMap.values());
+        const unique = validAddresses;
         
         try {
             const optimized = await RouteOptimizer.optimizeRoute(startRegion, unique, { username: ROUTEXL_USERNAME, password: ROUTEXL_PASSWORD }, startPoint);

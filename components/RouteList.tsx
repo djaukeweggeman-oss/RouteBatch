@@ -10,7 +10,7 @@ export function RouteList({ route }: RouteListProps) {
     if (!route || route.length === 0) return null;
 
     // Filter out START and ARNHEM/END stops for counting actual visits
-    const realStops = route.filter(stop => 
+    const realStops = route.filter(stop =>
         stop.filiaalnr !== 'START' && stop.filiaalnr !== 'ARNHEM' && stop.formule !== 'START' && stop.formule !== 'ARNHEM'
     );
 

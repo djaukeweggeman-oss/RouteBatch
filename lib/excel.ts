@@ -44,7 +44,9 @@ export const processExcel = async (buffer: ArrayBuffer): Promise<{ addresses: Ad
         const workbook = XLSX.read(buffer, { type: 'buffer' });
         console.log("📋 Available sheets:", workbook.SheetNames);
 
-        let globalBestResult = { addresses: [] as Address[], drivers: [] as string[], sheetName: "" };
+        let allValidAddresses: Address[] = [];
+        let allValidDrivers = new Set<string>();
+        let processedSheetNames: string[] = [];
 
         // Priority for sheet names
         const sortedSheets = [...workbook.SheetNames].sort((a, b) => {
@@ -77,11 +79,6 @@ export const processExcel = async (buffer: ArrayBuffer): Promise<{ addresses: Ad
                 const adresIdx = findCol(['ADRES', 'STRAAT', 'STREET', 'ADDRESS']);
                 const mercIdx = findCol(['MERCHANDISER', 'MERCHANSIDER', 'MERCHAND', 'MERCHAN', 'CHAUFFEUR', 'DRIVER', 'CHAUF']);
 
-                if (adresIdx === -1 || mercIdx === -1) return null;
-
-                const resultAddrs: Address[] = [];
-                const resultDrivers = new Set<string>();
-
                 const plaatsnaamIdx = findCol(['PLAATS', 'CITY', 'TOWN', 'LOCATION']);
                 const postcodeIdx = findCol(['POSTCODE', 'ZIP']);
                 const filiaalnrIdx = findCol(['FILIAAL', 'SHOP', 'STORE', 'WINKEL']);
@@ -90,20 +87,22 @@ export const processExcel = async (buffer: ArrayBuffer): Promise<{ addresses: Ad
                 const terrIdx = findCol(['TERRNR', 'TERR']); // Match TERRNR correctly
                 const boxIdx = findCol(['BOX']); // Exact feature for user requirement
 
+                // Adres is mandatory
+                if (adresIdx === -1) return null;
+
+                const resultAddrs: Address[] = [];
+                const resultDrivers = new Set<string>();
+
                 // Product columns (Ja/Nee for each brand) come AFTER 'Te verwijderen'
-                // 'Te verwijderen' is the last standard header (col 11 in actual file)
-                // Look for 'VERWIJDER' specifically; if not found, fall back to GOEDGEKEURD+2
                 const teVerwijderenIdx = findCol(['VERWIJDER']);
                 const goedgekeurdIdx2 = findCol(['GOEDGEKEURD']);
-                // productStartIdx: column index of the first product placement column
                 let productStartIdx: number;
                 if (teVerwijderenIdx >= 0) {
                     productStartIdx = teVerwijderenIdx + 1;
                 } else if (goedgekeurdIdx2 >= 0) {
-                    productStartIdx = goedgekeurdIdx2 + 2; // skip 'Te verwijderen' too
+                    productStartIdx = goedgekeurdIdx2 + 2; 
                 } else {
-                    // Last resort: start 4 cols after the last known standard column
-                    productStartIdx = Math.max(adresIdx, mercIdx, plaatsnaamIdx, postcodeIdx) + 4;
+                    productStartIdx = Math.max(adresIdx, mercIdx >= 0 ? mercIdx : adresIdx, plaatsnaamIdx, postcodeIdx) + 4;
                 }
 
                 for (let i = hdrIdx + 1; i < allRows.length; i++) {
@@ -111,15 +110,18 @@ export const processExcel = async (buffer: ArrayBuffer): Promise<{ addresses: Ad
                     if (row.length === 0) continue;
 
                     const adres = String(row[adresIdx] || '').trim();
-                    const merchandiser = String(row[mercIdx] || '').trim();
+                    const merchandiser = mercIdx >= 0 ? String(row[mercIdx] || '').trim() : '';
 
-                    // Skip empty mandatory fields or header repetitions
-                    if (!adres || !merchandiser) continue;
-                    // Skip rows where the address cell is literally a column header (not real addresses containing 'straat')
+                    // Adres is definitely mandatory
+                    if (!adres) continue;
+                    
+                    // Skip rows where the address cell is literally a column header
                     const cleanedAdres = cleanKey(adres);
                     if (cleanedAdres === 'ADRES' || cleanedAdres === 'STRAAT' || cleanedAdres === 'STREET' || cleanedAdres === 'ADDRESS') continue;
 
-                    resultDrivers.add(merchandiser);
+                    // Fallback to "Onbekend" to group any empty merchandisers
+                    const finalMerch = merchandiser || 'Onbekend';
+                    resultDrivers.add(finalMerch);
 
                     const plaats = plaatsnaamIdx >= 0 ? String(row[plaatsnaamIdx] || '').trim() : '';
                     const postcode = postcodeIdx >= 0 ? String(row[postcodeIdx] || '').trim() : '';
@@ -128,19 +130,17 @@ export const processExcel = async (buffer: ArrayBuffer): Promise<{ addresses: Ad
                     const bezoekdag = bezoekdagIdx >= 0 ? excelDateToDayName(row[bezoekdagIdx]) : undefined;
                     const terr = terrIdx >= 0 ? String(row[terrIdx] || '').trim() : '';
                     const boxName = boxIdx >= 0 ? String(row[boxIdx] || '').trim() : '';
-                    // Include postcode so geocoding works even when plaatsnaam is empty
                     const volledigAdres = [adres, postcode, plaats, 'Nederland'].filter(Boolean).join(', ');
 
-                    // Count 'Ja' values in the product placement columns only
                     let aantalPlaatsingen = 0;
                     for (let j = productStartIdx; j < row.length; j++) {
                         const val = String(row[j] || '').trim().toUpperCase();
-                        if (val === 'JA') aantalPlaatsingen++;
+                        if (val === 'JA' || val === 'X' || val === '1' || val === 'V') aantalPlaatsingen++;
                     }
 
                     resultAddrs.push({
                         filiaalnr, formule, straat: adres, postcode, plaats,
-                        merchandiser, volledigAdres, aantalPlaatsingen, bezoekdag, terr, boxName
+                        merchandiser: finalMerch, volledigAdres, aantalPlaatsingen, bezoekdag, terr, boxName
                     });
                 }
                 return { addresses: resultAddrs, drivers: Array.from(resultDrivers).sort() };
@@ -157,50 +157,36 @@ export const processExcel = async (buffer: ArrayBuffer): Promise<{ addresses: Ad
                 }
             }
 
-            if (sheetBest.addresses.length > globalBestResult.addresses.length) {
-                globalBestResult = { ...sheetBest, sheetName };
-                // Optimization: if we found a lot of data, we are likely done
-                if (sheetBest.addresses.length > 100) break;
+            if (sheetBest.addresses.length > 0) {
+                console.log(`✅ Found ${sheetBest.addresses.length} addresses in sheet "${sheetName}"`);
+                allValidAddresses.push(...sheetBest.addresses);
+                sheetBest.drivers.forEach(d => allValidDrivers.add(d));
+                processedSheetNames.push(sheetName);
             }
         }
 
-        if (globalBestResult.addresses.length === 0) {
+        if (allValidAddresses.length === 0) {
             console.error("❌ FAILED TO FIND ANY DATA ACROSS ALL SHEETS");
-            throw new Error("Kon geen geldige gegevens vinden. Zorg dat de kolommen 'Adres' en 'Merchandiser' (of 'Chauffeur') aanwezig zijn.");
+            throw new Error("Kon geen geldige gegevens vinden. Zorg dat de kolom 'Adres' aanwezig is.");
         }
 
-        console.log(`✅ Success! Found ${globalBestResult.addresses.length} addresses in sheet "${globalBestResult.sheetName}"`);
+        console.log(`✅ Success! Found ${allValidAddresses.length} total addresses across sheets: ${processedSheetNames.join(', ')}`);
 
-        const { addresses, drivers } = globalBestResult;
-        const hasDayInfo = addresses.some(a => !!a.bezoekdag);
-        let uniqueAddresses: Address[];
-
-        if (hasDayInfo) {
-            const grouped = new Map<string, Address>();
-            for (const addr of addresses) {
-                // Include filiaalnr in key so different stores at the same address are NOT merged
-                const key = `${addr.filiaalnr}|${addr.volledigAdres}|${addr.merchandiser}|${addr.bezoekdag}|${addr.terr || ''}|${addr.boxName || ''}`;
-                if (grouped.has(key)) {
-                    const existing = grouped.get(key)!;
-                    existing.aantalPlaatsingen = (existing.aantalPlaatsingen || 0) + (addr.aantalPlaatsingen || 0);
-                } else {
-                    grouped.set(key, { ...addr });
-                }
+        const grouped = new Map<string, Address>();
+        for (const addr of allValidAddresses) {
+            // Include filiaalnr in key so different stores at the same address are NOT merged
+            const key = `${addr.filiaalnr || ''}|${addr.volledigAdres}|${addr.merchandiser}|${addr.bezoekdag || ''}|${addr.terr || ''}|${addr.boxName || ''}`;
+            if (grouped.has(key)) {
+                const existing = grouped.get(key)!;
+                existing.aantalPlaatsingen = (existing.aantalPlaatsingen || 0) + (addr.aantalPlaatsingen || 0);
+            } else {
+                grouped.set(key, { ...addr });
             }
-            uniqueAddresses = Array.from(grouped.values());
-        } else {
-            uniqueAddresses = addresses.filter((addr, index, self) =>
-                index === self.findIndex((t) => (
-                    t.filiaalnr === addr.filiaalnr &&
-                    t.volledigAdres === addr.volledigAdres &&
-                    t.merchandiser === addr.merchandiser &&
-                    t.terr === addr.terr &&
-                    t.boxName === addr.boxName
-                ))
-            );
         }
+        
+        const uniqueAddresses = Array.from(grouped.values());
 
-        return { addresses: uniqueAddresses, drivers };
+        return { addresses: uniqueAddresses, drivers: Array.from(allValidDrivers).sort() };
 
     } catch (error) {
         console.error("💥 Excel processing error:", error);

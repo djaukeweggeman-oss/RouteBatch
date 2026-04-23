@@ -4,7 +4,7 @@ import { useState, useMemo } from 'react';
 import dynamic from 'next/dynamic';
 import { UploadZone } from '@/components/UploadZone';
 import { Address, BatchRouteResult } from '@/types';
-import { Truck, AlertTriangle, MapPin, ChevronDown, ChevronUp, PackageOpen } from 'lucide-react';
+import { Truck, AlertTriangle, MapPin, ChevronDown, ChevronUp, PackageOpen, CheckSquare, ShieldCheck, XCircle, Loader2 } from 'lucide-react';
 import { RouteList } from '@/components/RouteList';
 import { BOX_ADDRESSES } from '@/lib/regions';
 
@@ -13,16 +13,22 @@ const LeafletMap = dynamic(() => import('@/components/LeafletMap'), {
     loading: () => <div className="h-[400px] w-full bg-slate-100 animate-pulse rounded-xl" />
 });
 
+interface ValidationResult {
+    status: 'ok' | 'missing' | 'checking';
+    expected: number;
+    generated: number;
+    missingRoutes: { terr: string; merchandiser: string }[];
+}
+
 export default function Home() {
-    // State 
-    const [step, setStep] = useState<1 | 2 | 3 | 4>(1); // 1: Upload, 2: Select Box, 3: Processing, 4: Results
+    const [step, setStep] = useState<1 | 2 | 3 | 4>(1);
     const [isProcessing, setIsProcessing] = useState(false);
     const [error, setError] = useState<string | null>(null);
     const [progress, setProgress] = useState({ current: 0, total: 0 });
     const [batchResults, setBatchResults] = useState<BatchRouteResult[]>([]);
     const [expandedResultId, setExpandedResultId] = useState<string | null>(null);
+    const [validationResult, setValidationResult] = useState<ValidationResult | null>(null);
 
-    // Data from excel
     const [allAddresses, setAllAddresses] = useState<Address[]>([]);
     const [availableBoxes, setAvailableBoxes] = useState<string[]>([]);
     const [selectedBoxes, setSelectedBoxes] = useState<string[]>([]);
@@ -31,35 +37,42 @@ export default function Home() {
         try {
             setError(null);
             setAllAddresses(data.addresses);
-
-            // Extract unique boxes
             const uniqueBoxes = new Set<string>();
             data.addresses.forEach(addr => {
-                if (addr.boxName) uniqueBoxes.add(addr.boxName.trim());
+                const boxName = (addr.boxName || '').trim();
+                uniqueBoxes.add(boxName ? boxName : 'Onbekend');
             });
-
-            const boxList = Array.from(uniqueBoxes).filter(Boolean).sort();
-            
-            if (boxList.length === 0) {
-                // If no box names found, just make a fallback "Onbekend"
-                setAvailableBoxes(['Onbekend']);
-                setSelectedBoxes(['Onbekend']);
-            } else {
-                setAvailableBoxes(boxList);
-                setSelectedBoxes([]); // Let user choose
-            }
-            
+            const boxList = Array.from(uniqueBoxes).sort();
+            setAvailableBoxes(boxList);
+            setSelectedBoxes(boxList.length === 1 ? [boxList[0]] : []);
             setStep(2);
         } catch (err: any) {
-            console.error(err);
             setError(err.message || 'Fout bij het verwerken van de excel');
         }
     };
 
     const toggleBox = (box: string) => {
-        setSelectedBoxes(prev => 
+        setSelectedBoxes(prev =>
             prev.includes(box) ? prev.filter(b => b !== box) : [...prev, box]
         );
+    };
+
+    const selectAll = () => {
+        setSelectedBoxes(availableBoxes.length === selectedBoxes.length ? [] : [...availableBoxes]);
+    };
+
+    const runValidationAgent = (jobs: { terr: string; merchandiser: string; boxName: string }[], results: BatchRouteResult[]) => {
+        setValidationResult({ status: 'checking', expected: jobs.length, generated: results.length, missingRoutes: [] });
+        const missing = jobs.filter(job =>
+            !results.some(r => r.terr === job.terr && r.merchandiser === job.merchandiser && r.boxName === job.boxName)
+        ).map(j => ({ terr: j.terr, merchandiser: j.merchandiser }));
+
+        setValidationResult({
+            status: missing.length === 0 ? 'ok' : 'missing',
+            expected: jobs.length,
+            generated: results.length,
+            missingRoutes: missing
+        });
     };
 
     const startGeneration = async () => {
@@ -67,29 +80,26 @@ export default function Home() {
             setError("Selecteer minimaal één Box om door te gaan.");
             return;
         }
-
         try {
             setError(null);
-            setStep(3);
+            setValidationResult(null);
+            setStep(3); // Brief loading while geocoding
             setIsProcessing(true);
+            setBatchResults([]); // Clear previous results so streaming starts fresh
+            setProgress({ current: 0, total: 0 });
 
-            // Filter addresses for selected boxes
-            // If the box is "Onbekend", we keep addresses that have no boxName or match "Onbekend"
             const filteredAddresses = allAddresses.filter(addr => {
                 const boxN = addr.boxName ? addr.boxName.trim() : 'Onbekend';
                 return selectedBoxes.includes(boxN);
             });
 
-            // Group by TERR and then by driver
             const groups: { [key: string]: Address[] } = {};
             for (const addr of filteredAddresses) {
                 const terrKey = addr.terr ? String(addr.terr).trim() : 'Onbekend';
                 const merchaKey = addr.merchandiser ? String(addr.merchandiser).trim() : 'Onbekend';
                 const boxKey = addr.boxName ? String(addr.boxName).trim() : 'Onbekend';
                 const groupKey = `${terrKey}|${merchaKey}|${boxKey}`;
-                if (!groups[groupKey]) {
-                    groups[groupKey] = [];
-                }
+                if (!groups[groupKey]) groups[groupKey] = [];
                 groups[groupKey].push(addr);
             }
 
@@ -98,59 +108,86 @@ export default function Home() {
                 return { terr, merchandiser, boxName, addresses: addrs };
             });
 
-            setProgress({ current: 0, total: jobs.length });
-
-            const results: BatchRouteResult[] = [];
-            
-            // Keep previously generated results for the boxes that are STILL selected
             const cachedResults = batchResults.filter(r => selectedBoxes.includes(r.boxName));
-            results.push(...cachedResults);
-
-            const jobsToProcess = jobs.filter(job => 
+            const jobsToProcess = jobs.filter(job =>
                 !cachedResults.some(r => r.terr === job.terr && r.merchandiser === job.merchandiser && r.boxName === job.boxName)
             );
 
-            setProgress({ current: 0, total: jobsToProcess.length });
+            // PRE-GEOCODE: batch geocode all unique addresses in one shot
+            // This avoids redundant geocoding across parallel jobs
+            const uniqueAddrs = [...new Set(filteredAddresses
+                .filter(a => !a.lat || !a.lng)
+                .map(a => a.volledigAdres)
+            )];
 
-            // Process sequentially. Parallelizing OSRM Trip API causes 10+ sec throttling queues per request!
-            // With Sequential + PDOK, each job resolves lightning fast (~200ms per route)
-            for (let i = 0; i < jobsToProcess.length; i++) {
-                const job = jobsToProcess[i];
+            let coordMap: Record<string, { lat: number; lng: number } | null> = {};
+            if (uniqueAddrs.length > 0) {
                 try {
-                    console.log(`Processing job ${i + 1}/${jobsToProcess.length}: TERR ${job.terr}, Driver ${job.merchandiser}, Box ${job.boxName}`);
-                    
-                    const payload: any = { 
-                        startRegion: 'ARNHEM', // fallback
-                        addresses: job.addresses 
-                    };
+                    const geoRes = await fetch('/api/geocode', {
+                        method: 'POST',
+                        headers: { 'Content-Type': 'application/json' },
+                        body: JSON.stringify({ addresses: uniqueAddrs })
+                    });
+                    if (geoRes.ok) {
+                        const geoData = await geoRes.json();
+                        coordMap = geoData.coords || {};
+                    }
+                } catch (e) {
+                    console.warn('Pre-geocoding failed, falling back to per-job geocoding', e);
+                }
+            }
 
+            // Attach pre-geocoded coords to all addresses
+            const enrichedAddresses = filteredAddresses.map(addr => {
+                if (addr.lat && addr.lng) return addr;
+                const coords = coordMap[addr.volledigAdres];
+                return coords ? { ...addr, ...coords } : addr;
+            });
+
+            // Re-group with enriched addresses
+            const enrichedGroups: { [key: string]: Address[] } = {};
+            for (const addr of enrichedAddresses) {
+                const terrKey = addr.terr ? String(addr.terr).trim() : 'Onbekend';
+                const merchaKey = addr.merchandiser ? String(addr.merchandiser).trim() : 'Onbekend';
+                const boxKey = addr.boxName ? String(addr.boxName).trim() : 'Onbekend';
+                const groupKey = `${terrKey}|${merchaKey}|${boxKey}`;
+                if (!enrichedGroups[groupKey]) enrichedGroups[groupKey] = [];
+                enrichedGroups[groupKey].push(addr);
+            }
+
+            const enrichedJobs = jobsToProcess.map(job => ({
+                ...job,
+                addresses: enrichedGroups[`${job.terr}|${job.merchandiser}|${job.boxName}`] || job.addresses
+            }));
+
+            setProgress({ current: 0, total: enrichedJobs.length });
+
+            // Switch to step 4 NOW so routes stream in live
+            setBatchResults([...cachedResults]);
+            setStep(4);
+
+            const BATCH_SIZE = 12;
+            const newResults: BatchRouteResult[] = [];
+            let completedCount = 0;
+
+            const failedJobs: typeof enrichedJobs = [];
+
+            const processJob = async (job: typeof enrichedJobs[0]): Promise<BatchRouteResult | null> => {
+                try {
+                    const payload: any = { startRegion: 'ARNHEM', addresses: job.addresses };
                     if (job.boxName !== 'Onbekend') {
                         const exactAddress = BOX_ADDRESSES[job.boxName] || `${job.boxName}, Nederland`;
-                        payload.customStartPoint = {
-                            name: job.boxName,
-                            address: exactAddress
-                        };
+                        payload.customStartPoint = { name: job.boxName, address: exactAddress };
                     }
-
                     const res = await fetch('/api/optimize', {
                         method: 'POST',
                         headers: { 'Content-Type': 'application/json' },
                         body: JSON.stringify(payload)
                     });
-
-                    if (!res.ok) {
-                        const errText = await res.text();
-                        console.error(`Route optimalisatie faalde voor TERR ${job.terr}:`, errText);
-                        continue;
-                    }
-
+                    if (!res.ok) return null;
                     const resultData = await res.json();
-                    
-                    let totalDistKm = 0;
-                    let totalDurMin = 0;
-                    let totalPlaats = 0;
+                    let totalDistKm = 0, totalDurMin = 0, totalPlaats = 0;
                     let allStops: Address[] = [];
-
                     if (resultData.days) {
                         for (const day of resultData.days) {
                             totalDistKm += day.totalDistanceKm || 0;
@@ -164,28 +201,71 @@ export default function Home() {
                         totalPlaats = (resultData.stops || []).reduce((sum: number, s: Address) => sum + (s.aantalPlaatsingen || 0), 0);
                         allStops = resultData.stops || [];
                     }
-
-                    results.push({
-                        terr: job.terr,
-                        merchandiser: job.merchandiser,
-                        boxName: job.boxName,
-                        stops: allStops,
-                        totalDistanceKm: totalDistKm,
-                        totalDurationMin: totalDurMin,
-                        totalPlaatsingen: totalPlaats,
-                    });
-                } catch (err) {
-                    console.error("Job error:", err);
-                } finally {
-                    setProgress(prev => ({ ...prev, current: i + 1 }));
+                    return { terr: job.terr, merchandiser: job.merchandiser, boxName: job.boxName, stops: allStops, totalDistanceKm: totalDistKm, totalDurationMin: totalDurMin, totalPlaatsingen: totalPlaats };
+                } catch {
+                    return null;
                 }
-            }
-            results.sort((a, b) => b.totalDistanceKm - a.totalDistanceKm);
+            };
 
-            setBatchResults(results);
+            for (let i = 0; i < enrichedJobs.length; i += BATCH_SIZE) {
+                const batch = enrichedJobs.slice(i, i + BATCH_SIZE);
+
+                // Each job streams its result immediately when done
+                await Promise.all(batch.map(async (job, j) => {
+                    const r = await processJob(job);
+                    if (r) {
+                        newResults.push(r);
+                        // Stream result into UI immediately
+                        setBatchResults(prev => [...prev, r]);
+                    } else {
+                        failedJobs.push(batch[j]);
+                    }
+                    completedCount++;
+                    setProgress({ current: completedCount, total: enrichedJobs.length });
+                }));
+            }
+
+            // RETRY failed jobs one by one
+            for (const job of failedJobs) {
+                try {
+                    const payload: any = { startRegion: 'ARNHEM', addresses: job.addresses };
+                    if (job.boxName !== 'Onbekend') {
+                        const exactAddress = BOX_ADDRESSES[job.boxName] || `${job.boxName}, Nederland`;
+                        payload.customStartPoint = { name: job.boxName, address: exactAddress };
+                    }
+                    const res = await fetch('/api/optimize', {
+                        method: 'POST',
+                        headers: { 'Content-Type': 'application/json' },
+                        body: JSON.stringify(payload)
+                    });
+                    if (res.ok) {
+                        const resultData = await res.json();
+                        let totalDistKm = 0, totalDurMin = 0, totalPlaats = 0;
+                        let allStops: Address[] = [];
+                        if (resultData.days) {
+                            for (const day of resultData.days) {
+                                totalDistKm += day.totalDistanceKm || 0;
+                                totalDurMin += day.totalDurationMin || 0;
+                                totalPlaats += day.totalPlaatsingen || 0;
+                                allStops = allStops.concat(day.stops);
+                            }
+                        } else {
+                            totalDistKm = Math.round((resultData.totalDistance || 0) / 1000);
+                            totalDurMin = Math.round((resultData.totalDuration || 0) / 60);
+                            totalPlaats = (resultData.stops || []).reduce((sum: number, s: Address) => sum + (s.aantalPlaatsingen || 0), 0);
+                            allStops = resultData.stops || [];
+                        }
+                        newResults.push({ terr: job.terr, merchandiser: job.merchandiser, boxName: job.boxName, stops: allStops, totalDistanceKm: totalDistKm, totalDurationMin: totalDurMin, totalPlaatsingen: totalPlaats });
+                    }
+                } catch { /* skip if retry also fails */ }
+            }
+
+            const allResults = [...cachedResults, ...newResults];
+            allResults.sort((a, b) => b.totalDistanceKm - a.totalDistanceKm);
+            setBatchResults(allResults);
+            runValidationAgent(jobs, allResults);
             setStep(4);
         } catch (err: any) {
-            console.error(err);
             setError(err.message || 'Fout bij het verwerken van de generatie');
             setStep(2);
         } finally {
@@ -201,17 +281,16 @@ export default function Home() {
         setStep(1);
         setError(null);
         setProgress({ current: 0, total: 0 });
+        setValidationResult(null);
     };
 
     const backToBoxSelection = () => {
-        // We NO LONGER clear batchResults, so we can reuse them if the same box is still toggled on!
         setExpandedResultId(null);
         setStep(2);
         setProgress({ current: 0, total: 0 });
         setError(null);
     };
 
-    // Calculate outliers
     const { medianDistance, outlierThreshold } = useMemo(() => {
         if (batchResults.length === 0) return { medianDistance: 0, outlierThreshold: 0 };
         const dists = batchResults.map(r => r.totalDistanceKm).sort((a, b) => a - b);
@@ -232,19 +311,12 @@ export default function Home() {
                     <h1 className="text-4xl md:text-5xl font-extrabold tracking-tight text-slate-900">
                         Route<span className="text-blue-600">Batch</span>
                     </h1>
-                    <p className="text-lg text-slate-500 max-w-2xl mx-auto">
-                        Automatische controleer- en optimalisatietool voor planningen per TERR (box).
-                    </p>
+
                 </div>
 
-                {/* Error Message */}
                 {error && (
                     <div className="bg-red-50 border-l-4 border-red-500 p-4 rounded-xl shadow-sm animate-in fade-in slide-in-from-top-2">
-                        <div className="flex">
-                            <div className="ml-3">
-                                <p className="text-sm font-medium text-red-700">{error}</p>
-                            </div>
-                        </div>
+                        <p className="text-sm font-medium text-red-700">{error}</p>
                     </div>
                 )}
 
@@ -266,7 +338,19 @@ export default function Home() {
                                 De gekozen box is direct het <strong className="text-white">Startpunt</strong> voor de planners.
                             </p>
                         </div>
-                        <div className="p-6 md:p-8 space-y-6">
+                        <div className="p-6 md:p-8 space-y-4">
+                            {/* Select All button */}
+                            <div className="flex items-center justify-between">
+                                <span className="text-sm text-slate-500 font-medium">{selectedBoxes.length} van {availableBoxes.length} geselecteerd</span>
+                                <button
+                                    onClick={selectAll}
+                                    className="inline-flex items-center gap-2 px-4 py-2 bg-slate-100 hover:bg-blue-50 hover:text-blue-700 text-slate-600 rounded-xl font-semibold text-sm transition-all border border-slate-200 hover:border-blue-200"
+                                >
+                                    <CheckSquare className="w-4 h-4" />
+                                    {selectedBoxes.length === availableBoxes.length ? 'Deselecteer alles' : 'Selecteer alles'}
+                                </button>
+                            </div>
+
                             <div className="grid grid-cols-1 md:grid-cols-2 gap-4 max-h-[400px] overflow-y-auto pr-2">
                                 {availableBoxes.map(box => {
                                     const isSelected = selectedBoxes.includes(box);
@@ -306,16 +390,20 @@ export default function Home() {
                 {/* Step 3: Processing Progress */}
                 {step === 3 && (
                     <div className="max-w-xl mx-auto bg-white rounded-3xl shadow-xl p-8 text-center animate-in zoom-in-95 duration-300">
-                        <h2 className="text-2xl font-bold mb-4">Routes berekenen...</h2>
+                        <div className="flex items-center justify-center gap-3 mb-4">
+                            <Loader2 className="w-6 h-6 text-blue-600 animate-spin" />
+                            <h2 className="text-2xl font-bold">Routes berekenen...</h2>
+                        </div>
                         <div className="w-full bg-slate-100 rounded-full h-4 mb-4 overflow-hidden border border-slate-200">
-                            <div 
-                                className="bg-blue-600 h-4 rounded-full transition-all duration-500 ease-out" 
+                            <div
+                                className="bg-blue-600 h-4 rounded-full transition-all duration-500 ease-out"
                                 style={{ width: `${progress.total > 0 ? (progress.current / progress.total) * 100 : 0}%` }}
-                            ></div>
+                            />
                         </div>
                         <p className="text-slate-500 font-medium">
                             {progress.current} van de {progress.total} ritten verwerkt
                         </p>
+
                     </div>
                 )}
 
@@ -323,11 +411,27 @@ export default function Home() {
                 {step === 4 && (
                     <div className="space-y-6 animate-in fade-in slide-in-from-bottom-4 duration-500">
                         <div className="flex justify-between items-center bg-white p-4 md:p-6 rounded-2xl shadow-sm border border-slate-200">
-                            <div>
-                                <h2 className="text-2xl font-bold text-slate-800">Route Overzicht</h2>
-                                <p className="text-slate-500 text-sm mt-1">{batchResults.length} routes gegenereerd voor {selectedBoxes.join(', ')}</p>
+                            <div className="flex-1 min-w-0">
+                                <div className="flex items-center gap-3">
+                                    <h2 className="text-2xl font-bold text-slate-800">Route Overzicht</h2>
+                                    {isProcessing && <Loader2 className="w-5 h-5 text-blue-500 animate-spin shrink-0" />}
+                                </div>
+                                <p className="text-slate-500 text-sm mt-1">
+                                    {isProcessing
+                                        ? `${batchResults.length} van ${progress.total} routes geladen...`
+                                        : `${batchResults.length} routes gegenereerd voor ${selectedBoxes.join(', ')}`
+                                    }
+                                </p>
+                                {isProcessing && progress.total > 0 && (
+                                    <div className="mt-2 w-full bg-slate-100 rounded-full h-1.5 overflow-hidden">
+                                        <div
+                                            className="bg-blue-500 h-1.5 rounded-full transition-all duration-300 ease-out"
+                                            style={{ width: `${(progress.current / progress.total) * 100}%` }}
+                                        />
+                                    </div>
+                                )}
                             </div>
-                            <div className="flex gap-3">
+                            <div className="flex gap-3 ml-4 shrink-0">
                                 <button onClick={backToBoxSelection} className="px-5 py-2.5 bg-blue-100 hover:bg-blue-200 text-blue-700 font-semibold rounded-xl transition-colors">
                                     Kies andere box
                                 </button>
@@ -336,7 +440,43 @@ export default function Home() {
                                 </button>
                             </div>
                         </div>
-                        
+
+
+                        {/* Validation Agent Banner */}
+                        {validationResult && (
+                            <div className={`rounded-2xl border p-4 flex items-start gap-4 animate-in fade-in duration-300 ${
+                                validationResult.status === 'checking' ? 'bg-blue-50 border-blue-200' :
+                                validationResult.status === 'ok' ? 'bg-emerald-50 border-emerald-200' :
+                                'bg-amber-50 border-amber-200'
+                            }`}>
+                                <div className="shrink-0 mt-0.5">
+                                    {validationResult.status === 'checking' && <Loader2 className="w-5 h-5 text-blue-600 animate-spin" />}
+                                    {validationResult.status === 'ok' && <ShieldCheck className="w-5 h-5 text-emerald-600" />}
+                                    {validationResult.status === 'missing' && <XCircle className="w-5 h-5 text-amber-600" />}
+                                </div>
+                                <div className="flex-1">
+                                    <p className={`font-bold text-sm ${
+                                        validationResult.status === 'checking' ? 'text-blue-700' :
+                                        validationResult.status === 'ok' ? 'text-emerald-700' :
+                                        'text-amber-700'
+                                    }`}>
+                                        {validationResult.status === 'checking' && 'Validatie-agent controleert routes...'}
+                                        {validationResult.status === 'ok' && `✓ Alle ${validationResult.expected} verwachte routes zijn succesvol gegenereerd.`}
+                                        {validationResult.status === 'missing' && `⚠ ${validationResult.missingRoutes.length} route(s) ontbreken (${validationResult.generated}/${validationResult.expected} gegenereerd)`}
+                                    </p>
+                                    {validationResult.status === 'missing' && validationResult.missingRoutes.length > 0 && (
+                                        <ul className="mt-2 space-y-1">
+                                            {validationResult.missingRoutes.map((r, i) => (
+                                                <li key={i} className="text-amber-600 text-xs font-medium">
+                                                    • TERR {r.terr} – {r.merchandiser}
+                                                </li>
+                                            ))}
+                                        </ul>
+                                    )}
+                                </div>
+                            </div>
+                        )}
+
                         {batchResults.length > 0 && Object.entries(
                             batchResults.reduce((acc, res) => {
                                 const box = res.boxName || 'Onbekend';
@@ -354,15 +494,11 @@ export default function Home() {
                                     {routes.map((res, idx) => {
                                         const isOutlier = res.totalDistanceKm > outlierThreshold;
                                         const isExpanded = expandedResultId === `${res.terr}-${res.merchandiser}`;
-                                        
-                                        // Real stops count without start/end duplicates
                                         const realStops = res.stops.filter((s) => s.filiaalnr !== 'START' && s.filiaalnr !== 'ARNHEM').length;
 
                                         return (
                                             <div key={`${boxName}-${idx}`} className={`bg-white rounded-2xl shadow-md border-l-4 transition-all duration-300 ${isOutlier ? 'border-amber-500 hover:shadow-amber-100' : 'border-blue-500 hover:shadow-blue-100'} overflow-hidden`}>
-                                                
-                                                {/* Card Header (always visible) */}
-                                                <div 
+                                                <div
                                                     onClick={() => setExpandedResultId(isExpanded ? null : `${res.terr}-${res.merchandiser}`)}
                                                     className="p-4 md:p-6 cursor-pointer flex flex-col md:flex-row items-start md:items-center justify-between gap-4 group"
                                                 >
@@ -379,11 +515,10 @@ export default function Home() {
                                                             )}
                                                         </div>
                                                         <p className="text-slate-600 font-medium flex items-center gap-2">
-                                                            <span className="w-2 h-2 rounded-full bg-slate-300"></span>
+                                                            <span className="w-2 h-2 rounded-full bg-slate-300" />
                                                             {res.merchandiser}
                                                         </p>
                                                     </div>
-
                                                     <div className="flex flex-wrap md:flex-nowrap gap-4 md:gap-8 items-center w-full md:w-auto">
                                                         <div className="text-left md:text-right">
                                                             <p className="text-xs text-slate-400 font-bold uppercase tracking-wider mb-0.5">Stops</p>
@@ -406,8 +541,6 @@ export default function Home() {
                                                         </div>
                                                     </div>
                                                 </div>
-
-                                                {/* Expanded Details */}
                                                 {isExpanded && (
                                                     <div className="border-t border-slate-100 bg-slate-50/50 p-4 md:p-6 animate-in slide-in-from-top-2 duration-300 grid grid-cols-1 lg:grid-cols-3 gap-6">
                                                         <div className="lg:col-span-1">
