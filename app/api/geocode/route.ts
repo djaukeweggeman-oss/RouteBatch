@@ -78,7 +78,7 @@ export async function POST(req: NextRequest) {
         const addresses: string[] = body.addresses || [];
 
         // Deduplicate
-        const unique = [...new Set(addresses)];
+        const unique = Array.from(new Set(addresses));
 
         // Geocode in batches of 20 to avoid overwhelming APIs
         const BATCH = 20;
