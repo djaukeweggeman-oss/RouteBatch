@@ -115,10 +115,10 @@ export default function Home() {
 
             // PRE-GEOCODE: batch geocode all unique addresses in one shot
             // This avoids redundant geocoding across parallel jobs
-            const uniqueAddrs = [...new Set(filteredAddresses
+            const uniqueAddrs = Array.from(new Set(filteredAddresses
                 .filter(a => !a.lat || !a.lng)
                 .map(a => a.volledigAdres)
-            )];
+            ));
 
             let coordMap: Record<string, { lat: number; lng: number } | null> = {};
             if (uniqueAddrs.length > 0) {
